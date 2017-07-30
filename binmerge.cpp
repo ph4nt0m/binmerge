@@ -18,9 +18,23 @@ struct MatchResult
 
   // Results of the byte-wise comparison of the overlapping area
   std::size_t bytesDiffering = 0;
+
+  // Some useful methods
+  std::size_t overlapCount() const
+  {
+    return matchPosition + patternSize;
+  }
+
+  double quota() const
+  {
+    if (!patternFound || overlapCount() == 0)
+      return 0.0;
+    else
+      return static_cast<double>(overlapCount()-bytesDiffering) / overlapCount();
+  }
 };
 
-MatchResult searchInFile(std::istream& file, std::vector<unsigned char>& pattern)
+MatchResult searchInFile(std::istream& file, std::vector<unsigned char>& pattern, std::streampos pos = 0)
 {
   constexpr std::size_t blockSize = 4096;
 
@@ -28,7 +42,8 @@ MatchResult searchInFile(std::istream& file, std::vector<unsigned char>& pattern
   std::array<unsigned char, 2 * blockSize> buffer;
 
   // Read first block
-  file.seekg(0);
+  file.clear();
+  file.seekg(pos);
   file.read(reinterpret_cast<char*>(&buffer[0]), blockSize);
   std::size_t bytesReadPreviously = file.gcount();
 
@@ -37,7 +52,7 @@ MatchResult searchInFile(std::istream& file, std::vector<unsigned char>& pattern
     throw std::system_error();
 
   std::size_t realBufferSize = bytesReadPreviously;
-  std::size_t position = 0;
+  std::size_t position = pos;
 
   while (file || realBufferSize >= pattern.size())
   {
@@ -134,8 +149,8 @@ void printResults(const std::vector<std::string>& fileNames,
       break;
 
     std::cout << " |-> ";
-    std::size_t overlap = searchResults[i].matchPosition + searchResults[i].patternSize;
-    float quota = 100.0f * (overlap-searchResults[i].bytesDiffering) / overlap;
+    std::size_t overlap = searchResults[i].overlapCount();
+    float quota = 100.0 * searchResults[i].quota();
 
     if (searchResults[i].patternFound)
       std::cout << "overlap " << quota << "% (out of " << overlap << " bytes)" << '\n';
@@ -147,13 +162,14 @@ void printResults(const std::vector<std::string>& fileNames,
 /******************************************************************************/
 
 void mergeFiles(const std::vector<std::string>& fileNames,
-                const std::vector<MatchResult>& searchResults)
+                const std::vector<MatchResult>& searchResults,
+                const std::string& outputFileName)
 {
     // Create output file and
-    std::ofstream outputFile("output.bin", std::ios::binary);
+    std::ofstream outputFile(outputFileName, std::ios::binary);
     if(!outputFile)
     {
-        std::cerr << "File: " << "output.bin" << " failed to open." << '\n';
+        std::cerr << "File: " << outputFileName << " failed to open." << '\n';
         return;
     }
 
@@ -172,8 +188,7 @@ void mergeFiles(const std::vector<std::string>& fileNames,
       // The first file will always be copied entirely since it has no predecessor
       if (i > 0 && searchResults[i-1].patternFound)
       {
-        std::size_t seekPosition = searchResults[i-1].matchPosition +
-                                   searchResults[i-1].patternSize;
+        auto seekPosition = searchResults[i-1].overlapCount();
         inputFile.seekg(seekPosition);
       }
 
@@ -195,11 +210,11 @@ Usage:
 Options:
   -h --help               Show this screen.
   --version               Show version.
-  -o FILE, --output=FILE  Output file.
-  -y                      Silent.
+  -b, --best              Perform continuous search to find best match.
+  -o FILE, --output FILE  Output file [default: output.bin].
   )";
 
-  auto args = docopt::docopt(USAGE, {argv+1, argv+argc}, true, "binmerge 0.1.0");
+  auto args = docopt::docopt(USAGE, {argv+1, argv+argc}, true, "binmerge 0.2.0");
 
   //for(auto const& arg : args)
   //  std::cout << arg.first <<  arg.second << '\n';
@@ -221,6 +236,7 @@ Options:
   for (int i = 1; i < fileNames.size(); ++i)
   {
     // Extract last 20 bytes
+    file1.clear();
     file1.seekg(-20, std::ios_base::end);
 
     std::vector<unsigned char> pattern(
@@ -248,12 +264,37 @@ Options:
     }
 
     // Search pattern in second file
-    auto result = searchInFile(file2, pattern);
-    searchResults.push_back(result);
+    MatchResult result;
+    MatchResult lastResult = searchInFile(file2, pattern);
 
-    // Clear any stream flags
-    file1.clear();
-    file2.clear();
+    // Continue search, remembering best match
+    while (lastResult.patternFound)
+    {
+      // Clear any stream flags
+      file1.clear();
+      file2.clear();
+
+      // Position file pointers accordingly
+      file1.seekg(-lastResult.overlapCount(), std::ios_base::end);
+      file2.seekg(0);
+
+      // Peform a bytewise comparison of the potentially overlapping area
+      lastResult.bytesDiffering = compareFiles(file1, file2);
+
+      // Take this one if quota is higher
+      if (lastResult.quota() > result.quota())
+        result = lastResult;
+
+      // Abort if quota is sufficiently high (TODO: make this a user setting)
+      if (result.quota() > 0.7 || !args["--best"].asBool())
+        break;
+
+      // Continue from last match position
+      auto previousMatchPos = lastResult.matchPosition;
+      lastResult = searchInFile(file2, pattern, previousMatchPos+1);
+    }
+
+    searchResults.push_back(result);
 
     if(!result.patternFound)
     {
@@ -261,31 +302,14 @@ Options:
     }
     else
     {
-      std::cout << "Found pattern at position " << std::hex << result.matchPosition << std::dec;
-
-      std::size_t overlapCount = result.matchPosition + result.patternSize;
-      std::cout << " (possible overlap of " << overlapCount << " bytes)\n";
-
-      // Position file pointers accordingly
-      file1.seekg(-overlapCount, std::ios_base::end);
-      file2.seekg(0);
-
-      // Peform a bytewise comparison of the potentially overlapping area
-      std::size_t diff = compareFiles(file1, file2);
-
-      if(diff == 0)
-      {
-        std::cout << "Files overlap on last/first " << overlapCount << " bytes\n";
-      }
-      else
-      {
-        std::cout << "Overlap match quota: "
-                  << 100.0f * (overlapCount-diff) / overlapCount << "% ("
-                  << diff << " out of " << overlapCount << " bytes differ)\n";
-      }
-
-      searchResults.back().bytesDiffering = diff;
+      std::cout << "Found pattern at position " << std::hex
+                << result.matchPosition << std::dec << '\n'
+                << "Overlap match quota: " << std::fixed << std::setprecision(2)
+                << 100.0 * result.quota() << "% ("
+                << result.bytesDiffering << " out of "
+                << result.overlapCount() << " bytes differ)\n";
     }
+
     std::cout << "---------\n";
 
     file1.swap(file2); // alternatively, file1 = std::move(file2)
@@ -304,7 +328,7 @@ Options:
   std::cin >> decision;
 
   if (decision == 'y' || decision == 'Y')
-    mergeFiles(fileNames, searchResults);
+    mergeFiles(fileNames, searchResults, args["--output"].asString());
 
   return 0;
 }
